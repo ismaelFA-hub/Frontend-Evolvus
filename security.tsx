@@ -1,350 +1,374 @@
 /**
- * Evolvus Core Quantum — Admin IP Security Dashboard (Sprint LXIV)
+ * Evolvus Core Quantum — Security Dashboard (Module 15: Defense Grid)
  *
- * Shows all flagged/suspicious IPs with counts and options to block/unblock.
- * Uses the backend endpoints:
- *   GET  /admin/security       — list flagged IPs
- *   POST /admin/security/block  — block an IP
- *   POST /admin/security/unblock — unblock an IP
+ * Admin screen for real-time security monitoring:
+ * - Active threat summary (by severity)
+ * - Blocked IPs list
+ * - Incident timeline (last 24h)
+ * - Manual actions: block IP, unblock IP, resolve incident
  *
- * Access is restricted to Enterprise users (enforced server-side).
+ * Routes: GET  /api/security/health
+ *         GET  /api/security/threats
+ *         GET  /api/security/blocked
+ *         GET  /api/security/timeline
+ *         POST /api/security/respond
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
-  View,
-  Text,
-  ScrollView,
-  Pressable,
-  StyleSheet,
-  ActivityIndicator,
-  Alert,
-  Platform,
-  RefreshControl,
+  View, Text, ScrollView, Pressable, StyleSheet, ActivityIndicator, RefreshControl, TextInput, Alert,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import * as Haptics from "expo-haptics";
 import { router } from "expo-router";
 import Colors from "@/constants/colors";
+import { usePlanTheme } from "@/lib/theme-context";
 import { apiRequest } from "@/lib/query-client";
+import { useI18n } from "@/lib/i18n-context";
 
-const C = Colors.dark;
+// ── Types ────────────────────────────────────────────────────
 
-interface IpEntry {
-  ipAddress: string;
-  userCount: number;
-  totalRequests: number;
-  firstSeen: string;
-  lastSeen: string;
-  flagged: boolean;
-  blocked: boolean;
+interface IncidentSummary {
+  low: number;
+  medium: number;
+  high: number;
+  critical: number;
+  total: number;
 }
 
-export default function AdminSecurityScreen() {
-  const insets = useSafeAreaInsets();
-  const webTopInset = Platform.OS === "web" ? 67 : 0;
+interface SecurityHealth {
+  status: "healthy" | "degraded" | "critical";
+  summary: IncidentSummary;
+  recentAlerts: SecurityIncident[];
+  blockedIpCount: number;
+  honeypotPathCount: number;
+}
 
-  const [ips, setIps] = useState<IpEntry[]>([]);
+interface SecurityIncident {
+  id: number;
+  timestamp: string;
+  severity: "low" | "medium" | "high" | "critical";
+  type: string;
+  sourceIp?: string;
+  userId?: number;
+  endpoint?: string;
+  description: string;
+  action: string;
+  resolved: boolean;
+  resolvedAt?: string;
+}
+
+interface BlockedIp {
+  ip: string;
+  reason: string;
+  expiresAt: number;
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+
+function severityColor(s: string): string {
+  switch (s) {
+    case "critical": return "#ef4444";
+    case "high":     return "#f97316";
+    case "medium":   return "#eab308";
+    case "low":      return "#22c55e";
+    default:         return "#6b7280";
+  }
+}
+
+function statusColor(s: string): string {
+  switch (s) {
+    case "critical": return "#ef4444";
+    case "degraded": return "#f97316";
+    default:         return "#22c55e";
+  }
+}
+
+function fmtTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
+function fmtDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
+// ── Main Component ───────────────────────────────────────────
+
+export default function SecurityScreen() {
+  const { t } = useI18n();
+  const insets = useSafeAreaInsets();
+  const { theme } = usePlanTheme();
+  const C = Colors[theme ?? "dark"] ?? Colors.dark;
+
+  const [health, setHealth] = useState<SecurityHealth | null>(null);
+  const [incidents, setIncidents] = useState<SecurityIncident[]>([]);
+  const [blocked, setBlocked] = useState<BlockedIp[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [actioning, setActioning] = useState<string | null>(null);
+  const [blockIpInput, setBlockIpInput] = useState("");
+  const [responding, setResponding] = useState(false);
+  const [tab, setTab] = useState<"threats" | "blocked" | "timeline">("threats");
 
-  const load = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true);
-    setError(null);
+  const fetchAll = useCallback(async () => {
     try {
-      const res = await apiRequest("GET", "/admin/security");
-      if (!res.ok) {
-        const data = await res.json() as { message?: string };
-        throw new Error(data.message ?? `HTTP ${res.status}`);
-      }
-      const data = await res.json() as { flaggedIps: IpEntry[] };
-      setIps(data.flaggedIps ?? []);
-    } catch (err) {
-      setError((err as Error).message ?? "Falha ao carregar IPs.");
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
+      const [h, t, b] = await Promise.all([
+        apiRequest<SecurityHealth>("GET", "/api/security/health"),
+        apiRequest<{ incidents: SecurityIncident[] }>("GET", "/api/security/threats"),
+        apiRequest<{ blockedIps: BlockedIp[] }>("GET", "/api/security/blocked"),
+      ]);
+      setHealth(h);
+      setIncidents(t.incidents ?? []);
+      setBlocked(b.blockedIps ?? []);
+    } catch (e) {
+      // non-fatal
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    fetchAll().finally(() => setLoading(false));
+    const id = setInterval(fetchAll, 30_000); // poll every 30s
+    return () => clearInterval(id);
+  }, [fetchAll]);
 
-  const handleBlock = useCallback(async (ip: string, currentlyBlocked: boolean) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    const action = currentlyBlocked ? "unblock" : "block";
-    Alert.alert(
-      currentlyBlocked ? "Desbloquear IP" : "Bloquear IP",
-      `Deseja ${currentlyBlocked ? "desbloquear" : "bloquear"} o IP ${ip}?`,
-      [
-        { text: "Cancelar", style: "cancel" },
-        {
-          text: currentlyBlocked ? "Desbloquear" : "Bloquear",
-          style: currentlyBlocked ? "default" : "destructive",
-          onPress: async () => {
-            setActioning(ip);
-            try {
-              const res = await apiRequest("POST", `/admin/security/${action}`, { ip });
-              if (!res.ok) {
-                const d = await res.json() as { message?: string };
-                Alert.alert("Erro", d.message ?? "Falha na operação.");
-              } else {
-                setIps((prev) =>
-                  prev.map((entry) =>
-                    entry.ipAddress === ip ? { ...entry, blocked: !currentlyBlocked } : entry,
-                  ),
-                );
-              }
-            } catch {
-              Alert.alert("Erro", "Não foi possível executar a ação.");
-            } finally {
-              setActioning(null);
-            }
-          },
-        },
-      ],
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await fetchAll();
+    setRefreshing(false);
+  }, [fetchAll]);
+
+  const respond = useCallback(async (action: object) => {
+    setResponding(true);
+    try {
+      await apiRequest("POST", "/api/security/respond", action);
+      await fetchAll();
+    } catch (e) {
+      Alert.alert("Error", "Action failed. Check your permissions.");
+    } finally {
+      setResponding(false);
+    }
+  }, [fetchAll]);
+
+  const handleBlockIp = () => {
+    const ip = blockIpInput.trim();
+    if (!ip) return;
+    Alert.alert("Block IP", `Block ${ip} for 30 minutes?`, [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Block", style: "destructive",
+        onPress: () => respond({ action: "block_ip", ip }),
+      },
+    ]);
+  };
+
+  const handleUnblockIp = (ip: string) => {
+    Alert.alert("Unblock IP", `Unblock ${ip}?`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Unblock", onPress: () => respond({ action: "unblock_ip", ip }) },
+    ]);
+  };
+
+  const handleResolve = (id: number) => {
+    Alert.alert("Resolve Incident", "Mark this incident as resolved?", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Resolve", onPress: () => respond({ action: "resolve_incident", incidentId: id }) },
+    ]);
+  };
+
+  if (loading) {
+    return (
+      <View style={[s.center, { backgroundColor: C.background }]}>
+        <ActivityIndicator size="large" color={C.tint} />
+      </View>
     );
-  }, []);
+  }
 
-  const flaggedCount = ips.filter((e) => e.flagged).length;
-  const blockedCount = ips.filter((e) => e.blocked).length;
+  const statusText = health?.status ?? "unknown";
 
   return (
-    <View style={[styles.container, { paddingTop: insets.top + webTopInset }]}>
+    <View style={[s.root, { backgroundColor: C.background, paddingTop: insets.top }]}>
       {/* Header */}
-      <View style={styles.header}>
-        <Pressable
-          onPress={() => { Haptics.selectionAsync(); router.back(); }}
-          style={styles.backBtn}
-          accessibilityLabel="Voltar"
-          accessibilityRole="button"
-        >
-          <Ionicons name="chevron-back" size={24} color={C.text} />
+      <View style={s.header}>
+        <Pressable onPress={() => router.back()} style={s.backBtn}>
+          <Ionicons name="arrow-back" size={22} color={C.text} />
         </Pressable>
-        <Text style={styles.title}>🛡️ Segurança — IPs</Text>
-        <Pressable
-          onPress={() => { setRefreshing(true); load(true); }}
-          style={styles.backBtn}
-          accessibilityLabel="Recarregar"
-          accessibilityRole="button"
-        >
-          <Ionicons name="refresh" size={22} color={C.text} />
-        </Pressable>
-      </View>
-
-      {/* Stats row */}
-      <View style={styles.statsRow}>
-        <View style={styles.statCard}>
-          <Text style={styles.statValue}>{ips.length}</Text>
-          <Text style={styles.statLabel}>IPs Monitorados</Text>
-        </View>
-        <View style={[styles.statCard, { borderColor: "#F7931A30" }]}>
-          <Text style={[styles.statValue, { color: "#F7931A" }]}>{flaggedCount}</Text>
-          <Text style={styles.statLabel}>Flagged</Text>
-        </View>
-        <View style={[styles.statCard, { borderColor: "#EF444430" }]}>
-          <Text style={[styles.statValue, { color: "#EF4444" }]}>{blockedCount}</Text>
-          <Text style={styles.statLabel}>Bloqueados</Text>
+        <Text style={[s.title, { color: C.text }]}>{t('security')}</Text>
+        <View style={[s.statusBadge, { backgroundColor: statusColor(statusText) + "22", borderColor: statusColor(statusText) }]}>
+          <Text style={[s.statusText, { color: statusColor(statusText) }]}>{statusText.toUpperCase()}</Text>
         </View>
       </View>
 
-      {loading ? (
-        <View style={styles.center}>
-          <ActivityIndicator size="large" color="#EF4444" />
-          <Text style={styles.loadingText}>Carregando IPs...</Text>
-        </View>
-      ) : error ? (
-        <View style={styles.center}>
-          <Ionicons name="alert-circle" size={48} color={C.error} />
-          <Text style={styles.errorText}>{error}</Text>
-          <Pressable style={styles.retryBtn} onPress={() => load()}>
-            <Text style={styles.retryBtnText}>Tentar novamente</Text>
+      <ScrollView
+        contentContainerStyle={s.scroll}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.tint} />}
+      >
+        {/* Summary Cards */}
+        {health && (
+          <View style={s.cardRow}>
+            {(["critical", "high", "medium", "low"] as const).map((sev) => (
+              <View key={sev} style={[s.severityCard, { backgroundColor: C.card, borderColor: severityColor(sev) }]}>
+                <Text style={[s.sevCount, { color: severityColor(sev) }]}>{health.summary[sev]}</Text>
+                <Text style={[s.sevLabel, { color: C.subtext }]}>{sev}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {/* Stats row */}
+        {health && (
+          <View style={[s.statsRow, { backgroundColor: C.card }]}>
+            <View style={s.stat}>
+              <Text style={[s.statNum, { color: C.text }]}>{health.blockedIpCount}</Text>
+              <Text style={[s.statLabel, { color: C.subtext }]}>Blocked IPs</Text>
+            </View>
+            <View style={s.stat}>
+              <Text style={[s.statNum, { color: C.text }]}>{health.summary.total}</Text>
+              <Text style={[s.statLabel, { color: C.subtext }]}>Open Incidents</Text>
+            </View>
+            <View style={s.stat}>
+              <Text style={[s.statNum, { color: C.text }]}>{health.honeypotPathCount}</Text>
+              <Text style={[s.statLabel, { color: C.subtext }]}>Honeypots</Text>
+            </View>
+          </View>
+        )}
+
+        {/* Block IP input */}
+        <View style={[s.blockRow, { backgroundColor: C.card }]}>
+          <TextInput
+            style={[s.ipInput, { color: C.text, borderColor: C.border }]}
+            placeholder="IP to block (e.g. 1.2.3.4)"
+            placeholderTextColor={C.subtext}
+            value={blockIpInput}
+            onChangeText={setBlockIpInput}
+            autoCapitalize="none"
+            keyboardType="numbers-and-punctuation"
+          />
+          <Pressable
+            style={[s.blockBtn, { backgroundColor: "#ef4444" }]}
+            onPress={handleBlockIp}
+            disabled={responding}
+          >
+            <Text style={s.blockBtnText}>Block IP</Text>
           </Pressable>
         </View>
-      ) : ips.length === 0 ? (
-        <View style={styles.center}>
-          <Ionicons name="shield-checkmark" size={64} color="#10B981" />
-          <Text style={[styles.emptyText, { color: "#10B981" }]}>Nenhum IP suspeito detectado</Text>
-        </View>
-      ) : (
-        <ScrollView
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={styles.scrollContent}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(true); }} />}
-        >
-          {ips.map((entry) => (
-            <View
-              key={entry.ipAddress}
-              style={[
-                styles.ipCard,
-                entry.blocked && { borderColor: "#EF4444", borderWidth: 1.5 },
-                entry.flagged && !entry.blocked && { borderColor: "#F7931A", borderWidth: 1.5 },
-              ]}
-              accessibilityRole="article"
-              accessibilityLabel={`IP ${entry.ipAddress}`}
-            >
-              <View style={styles.ipRow}>
-                <View style={styles.ipInfo}>
-                  <View style={styles.ipAddressRow}>
-                    <Ionicons
-                      name={entry.blocked ? "ban" : entry.flagged ? "warning" : "globe"}
-                      size={16}
-                      color={entry.blocked ? "#EF4444" : entry.flagged ? "#F7931A" : C.textSecondary}
-                    />
-                    <Text style={[styles.ipAddress, entry.blocked && { color: "#EF4444" }]}>
-                      {entry.ipAddress}
-                    </Text>
-                    {entry.blocked && (
-                      <View style={styles.blockedBadge}>
-                        <Text style={styles.blockedBadgeText}>BLOQUEADO</Text>
-                      </View>
-                    )}
-                    {entry.flagged && !entry.blocked && (
-                      <View style={styles.flaggedBadge}>
-                        <Text style={styles.flaggedBadgeText}>SUSPEITO</Text>
-                      </View>
-                    )}
-                  </View>
-                  <Text style={styles.ipMeta}>
-                    {entry.userCount} conta(s) · {entry.totalRequests} reqs
-                  </Text>
-                  <Text style={styles.ipMeta}>
-                    Último acesso: {new Date(entry.lastSeen).toLocaleString("pt-BR")}
-                  </Text>
-                </View>
 
-                <Pressable
-                  style={[
-                    styles.actionBtn,
-                    { backgroundColor: entry.blocked ? "#10B98120" : "#EF444420" },
-                  ]}
-                  onPress={() => handleBlock(entry.ipAddress, entry.blocked)}
-                  disabled={actioning === entry.ipAddress}
-                  accessibilityRole="button"
-                  accessibilityLabel={entry.blocked ? "Desbloquear IP" : "Bloquear IP"}
-                >
-                  {actioning === entry.ipAddress ? (
-                    <ActivityIndicator size="small" color={entry.blocked ? "#10B981" : "#EF4444"} />
-                  ) : (
-                    <>
-                      <Ionicons
-                        name={entry.blocked ? "lock-open" : "ban"}
-                        size={18}
-                        color={entry.blocked ? "#10B981" : "#EF4444"}
-                      />
-                      <Text style={[styles.actionBtnText, { color: entry.blocked ? "#10B981" : "#EF4444" }]}>
-                        {entry.blocked ? "Desbloquear" : "Bloquear"}
-                      </Text>
-                    </>
-                  )}
+        {/* Tabs */}
+        <View style={[s.tabs, { backgroundColor: C.card }]}>
+          {(["threats", "blocked", "timeline"] as const).map((t2) => (
+            <Pressable
+              key={t2}
+              style={[s.tabBtn, tab === t2 && { borderBottomColor: C.tint, borderBottomWidth: 2 }]}
+              onPress={() => setTab(t2)}
+            >
+              <Text style={[s.tabText, { color: tab === t2 ? C.tint : C.subtext }]}>
+                {t2.charAt(0).toUpperCase() + t2.slice(1)}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {/* Incidents tab */}
+        {tab === "threats" && (
+          <View>
+            {incidents.length === 0 ? (
+              <Text style={[s.empty, { color: C.subtext }]}>✅ No open threats</Text>
+            ) : incidents.map((inc) => (
+              <View key={inc.id} style={[s.incidentRow, { backgroundColor: C.card, borderLeftColor: severityColor(inc.severity) }]}>
+                <View style={s.incHeader}>
+                  <Text style={[s.incType, { color: severityColor(inc.severity) }]}>{inc.type.replace(/_/g, " ").toUpperCase()}</Text>
+                  <Text style={[s.incTime, { color: C.subtext }]}>{fmtDate(inc.timestamp)}</Text>
+                </View>
+                <Text style={[s.incDesc, { color: C.text }]} numberOfLines={2}>{inc.description}</Text>
+                {inc.sourceIp && <Text style={[s.incMeta, { color: C.subtext }]}>IP: {inc.sourceIp}</Text>}
+                <Pressable style={s.resolveBtn} onPress={() => handleResolve(inc.id)}>
+                  <Text style={s.resolveBtnText}>✓ Resolve</Text>
                 </Pressable>
               </View>
-            </View>
-          ))}
-
-          {/* Info note */}
-          <View style={styles.infoNote}>
-            <Ionicons name="information-circle" size={16} color={C.textSecondary} />
-            <Text style={styles.infoNoteText}>
-              IPs com mais de 3 contas são automaticamente flagged. IPs usados em contas com trial são bloqueados para novos registros.
-            </Text>
+            ))}
           </View>
-        </ScrollView>
-      )}
+        )}
+
+        {/* Blocked IPs tab */}
+        {tab === "blocked" && (
+          <View>
+            {blocked.length === 0 ? (
+              <Text style={[s.empty, { color: C.subtext }]}>No IPs currently blocked</Text>
+            ) : blocked.map((b) => (
+              <View key={b.ip} style={[s.incidentRow, { backgroundColor: C.card, borderLeftColor: "#ef4444" }]}>
+                <View style={s.incHeader}>
+                  <Text style={[s.incType, { color: C.text }]}>{b.ip}</Text>
+                  <Text style={[s.incTime, { color: C.subtext }]}>Exp: {fmtTime(new Date(b.expiresAt).toISOString())}</Text>
+                </View>
+                <Text style={[s.incMeta, { color: C.subtext }]}>{b.reason}</Text>
+                <Pressable style={[s.resolveBtn, { backgroundColor: "#22c55e22" }]} onPress={() => handleUnblockIp(b.ip)}>
+                  <Text style={[s.resolveBtnText, { color: "#22c55e" }]}>↑ Unblock</Text>
+                </Pressable>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {/* Timeline tab — recent alerts from health endpoint */}
+        {tab === "timeline" && (
+          <View>
+            {(health?.recentAlerts ?? []).length === 0 ? (
+              <Text style={[s.empty, { color: C.subtext }]}>No recent high-severity alerts</Text>
+            ) : (health?.recentAlerts ?? []).map((inc) => (
+              <View key={inc.id} style={[s.incidentRow, { backgroundColor: C.card, borderLeftColor: severityColor(inc.severity) }]}>
+                <View style={s.incHeader}>
+                  <Text style={[s.incType, { color: severityColor(inc.severity) }]}>{inc.type.replace(/_/g, " ").toUpperCase()}</Text>
+                  <Text style={[s.incTime, { color: C.subtext }]}>{fmtDate(inc.timestamp)}</Text>
+                </View>
+                <Text style={[s.incDesc, { color: C.text }]} numberOfLines={2}>{inc.description}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+      </ScrollView>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: C.background },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
-  },
-  backBtn: { width: 40, height: 40, justifyContent: "center", alignItems: "center" },
-  title: { fontSize: 18, fontWeight: "700", color: C.text },
-  statsRow: {
-    flexDirection: "row",
-    gap: 12,
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
-  },
-  statCard: {
-    flex: 1,
-    backgroundColor: C.surface,
-    borderRadius: 12,
-    padding: 12,
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: C.border,
-  },
-  statValue: { fontSize: 22, fontWeight: "800", color: C.text },
-  statLabel: { fontSize: 11, color: C.textSecondary, marginTop: 2 },
-  center: { flex: 1, justifyContent: "center", alignItems: "center", padding: 24 },
-  loadingText: { marginTop: 12, fontSize: 14, color: C.textSecondary },
-  errorText: { marginTop: 12, fontSize: 14, color: C.error, textAlign: "center" },
-  emptyText: { fontSize: 16, fontWeight: "600", marginTop: 12 },
-  retryBtn: {
-    marginTop: 16,
-    paddingHorizontal: 24,
-    paddingVertical: 10,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: C.error,
-  },
-  retryBtnText: { fontSize: 14, fontWeight: "600", color: C.error },
-  scrollContent: { padding: 16, gap: 10 },
-  ipCard: {
-    backgroundColor: C.surface,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: C.border,
-    padding: 14,
-  },
-  ipRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  ipInfo: { flex: 1, gap: 4 },
-  ipAddressRow: { flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
-  ipAddress: { fontSize: 14, fontWeight: "700", color: C.text, fontFamily: Platform.OS === "ios" ? "Courier" : "monospace" },
-  blockedBadge: {
-    backgroundColor: "#EF444420",
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  blockedBadgeText: { fontSize: 10, fontWeight: "700", color: "#EF4444" },
-  flaggedBadge: {
-    backgroundColor: "#F7931A20",
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  flaggedBadgeText: { fontSize: 10, fontWeight: "700", color: "#F7931A" },
-  ipMeta: { fontSize: 12, color: C.textSecondary },
-  actionBtn: {
-    padding: 10,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 4,
-    minWidth: 90,
-  },
-  actionBtnText: { fontSize: 11, fontWeight: "700" },
-  infoNote: {
-    flexDirection: "row",
-    gap: 8,
-    alignItems: "flex-start",
-    backgroundColor: C.surface,
-    borderRadius: 10,
-    padding: 12,
-    marginTop: 8,
-  },
-  infoNoteText: { flex: 1, fontSize: 12, color: C.textSecondary, lineHeight: 18 },
+// ── Styles ───────────────────────────────────────────────────
+
+const s = StyleSheet.create({
+  root: { flex: 1 },
+  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+  scroll: { padding: 16, paddingBottom: 40 },
+  header: { flexDirection: "row", alignItems: "center", padding: 16, gap: 12 },
+  backBtn: { padding: 4 },
+  title: { flex: 1, fontSize: 18, fontWeight: "700" },
+  statusBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8, borderWidth: 1 },
+  statusText: { fontSize: 11, fontWeight: "700" },
+  cardRow: { flexDirection: "row", gap: 8, marginBottom: 12 },
+  severityCard: { flex: 1, borderRadius: 10, borderWidth: 1, padding: 10, alignItems: "center" },
+  sevCount: { fontSize: 22, fontWeight: "800" },
+  sevLabel: { fontSize: 10, textTransform: "uppercase", marginTop: 2 },
+  statsRow: { flexDirection: "row", borderRadius: 10, padding: 12, marginBottom: 12 },
+  stat: { flex: 1, alignItems: "center" },
+  statNum: { fontSize: 20, fontWeight: "700" },
+  statLabel: { fontSize: 11, marginTop: 2 },
+  blockRow: { flexDirection: "row", alignItems: "center", borderRadius: 10, padding: 10, gap: 8, marginBottom: 12 },
+  ipInput: { flex: 1, height: 38, borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, fontSize: 14 },
+  blockBtn: { paddingHorizontal: 14, paddingVertical: 9, borderRadius: 8 },
+  blockBtnText: { color: "#fff", fontWeight: "600", fontSize: 13 },
+  tabs: { flexDirection: "row", borderRadius: 10, marginBottom: 12, overflow: "hidden" },
+  tabBtn: { flex: 1, alignItems: "center", paddingVertical: 10 },
+  tabText: { fontSize: 13, fontWeight: "600" },
+  empty: { textAlign: "center", marginTop: 20, fontSize: 14 },
+  incidentRow: { borderRadius: 10, borderLeftWidth: 4, padding: 12, marginBottom: 8 },
+  incHeader: { flexDirection: "row", justifyContent: "space-between", marginBottom: 4 },
+  incType: { fontSize: 11, fontWeight: "700" },
+  incTime: { fontSize: 11 },
+  incDesc: { fontSize: 13, marginBottom: 4 },
+  incMeta: { fontSize: 11, marginBottom: 6 },
+  resolveBtn: { alignSelf: "flex-start", backgroundColor: "#22c55e22", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6 },
+  resolveBtnText: { color: "#22c55e", fontSize: 12, fontWeight: "600" },
 });
