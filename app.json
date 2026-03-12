@@ -1,0 +1,56 @@
+{
+  "expo": {
+    "name": "Evolvus Core Quantum",
+    "slug": "evolvus-core-quantum",
+    "version": "1.0.0",
+    "orientation": "default",
+    "icon": "./assets/images/icon.png",
+    "scheme": "evolvus",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0E17"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.evolvus.corequantum"
+    },
+    "android": {
+      "package": "com.evolvus.corequantum",
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0E17",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "backgroundImage": "./assets/images/android-icon-background.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+      }
+    },
+    "web": {
+      "favicon": "./assets/images/favicon.png",
+      "bundler": "metro",
+      "output": "single",
+      "themeColor": "#0A0E17",
+      "backgroundColor": "#0A0E17",
+      "meta": {
+        "appleMobileWebAppCapable": "yes",
+        "appleMobileWebAppStatusBarStyle": "black-translucent"
+      }
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-web-browser",
+      "expo-secure-store"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "router": {
+        "origin": "https://a2cc0cf8-d3d0-4d27-a5fb-834bd102321d-00-2j6zht9h9s977.riker.replit.dev"
+      }
+    }
+  }
+}
