@@ -1,0 +1,13 @@
+name: Radar Public Actions Smoke
+
+on:
+  push:
+    branches:
+      - radar-actions-public-smoke
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "public-runner-ok"
